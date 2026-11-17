@@ -31,7 +31,12 @@ pub fn read_header<R: Read>(reader: &mut R) -> Result<(), Error> {
             "unsupported version {version}; this build supports {VERSION}"
         )));
     }
-    let _flags = read_u16(reader)?;
+    let flags = read_u16(reader)?;
+    if flags != 0 {
+        return Err(Error::InvalidTrace(format!(
+            "unsupported header flags {flags:#06x}"
+        )));
+    }
     Ok(())
 }
 
@@ -150,4 +155,19 @@ fn read_u64<R: Read>(reader: &mut R) -> Result<u64, Error> {
     let mut bytes = [0; 8];
     reader.read_exact(&mut bytes)?;
     Ok(u64::from_le_bytes(bytes))
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use std::io::Cursor;
+
+    #[test]
+    fn rejects_unknown_header_flags() {
+        let mut bytes = Vec::new();
+        write_header(&mut bytes).expect("write header");
+        bytes[10] = 1;
+        let error = read_header(&mut Cursor::new(bytes)).expect_err("flags must be zero");
+        assert!(error.to_string().contains("unsupported header flags"));
+    }
 }

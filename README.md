@@ -105,11 +105,13 @@ All integers are little-endian. A trace is:
 | Trailer | 8-byte `PARADEND` marker, `u64` event count |
 
 Event kinds are `1` process metadata, `2` stdin, `3` stdout, `4` stderr, `5`
-exit status, and `32` explicitly instrumented application values. Payloads are
-limited to 64 MiB. Frames are streamed through buffered file I/O and decoded
-into owned values. Checksums detect accidental corruption; they do not provide
-authentication or protect a trace against malicious modification. The current
-format is not memory-mapped and does not offer zero-copy decoding.
+exit status, and `32` explicitly instrumented application values. The exit
+payload stores a success flag, an exit-code-present flag, and a signed 32-bit
+code. Application event payloads are defined by the instrumentation API.
+Payloads are limited to 64 MiB. Frames are streamed through buffered file I/O
+and decoded into owned values. Checksums detect accidental corruption; they do
+not provide authentication or protect a trace against malicious modification.
+The current format is not memory-mapped and does not offer zero-copy decoding.
 
 ## Architecture
 

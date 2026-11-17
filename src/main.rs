@@ -293,10 +293,19 @@ fn run_child(
     let input = stdin_bytes.to_vec();
     let writer = thread::spawn(move || child_stdin.write_all(&input));
     let output = child.wait_with_output()?;
-    writer
+    let write_result = writer
         .join()
-        .map_err(|_| Error::Process("stdin writer thread panicked".into()))??;
+        .map_err(|_| Error::Process("stdin writer thread panicked".into()))?;
+    finish_stdin_write(write_result)?;
     Ok(output)
+}
+
+fn finish_stdin_write(result: io::Result<()>) -> Result<(), Error> {
+    match result {
+        Ok(()) => Ok(()),
+        Err(error) if error.kind() == io::ErrorKind::BrokenPipe => Ok(()),
+        Err(error) => Err(Error::Io(error)),
+    }
 }
 
 fn read_bounded<R: Read>(reader: R, limit: usize, name: &str) -> Result<Vec<u8>, Error> {
@@ -320,10 +329,24 @@ fn encode_metadata(metadata: &ProcessMetadata) -> Vec<u8> {
 }
 
 fn encode_exit(code: Option<i32>, success: bool) -> Vec<u8> {
-    let mut output = Vec::with_capacity(5);
+    let mut output = Vec::with_capacity(6);
     output.push(u8::from(success));
-    output.extend_from_slice(&code.unwrap_or(i32::MIN).to_le_bytes());
+    output.push(u8::from(code.is_some()));
+    output.extend_from_slice(&code.unwrap_or_default().to_le_bytes());
     output
+}
+
+fn decode_exit(bytes: &[u8]) -> Result<(Option<i32>, bool), Error> {
+    if bytes.len() != 6 {
+        return Err(Error::InvalidTrace("invalid exit event length".into()));
+    }
+    if bytes[0] > 1 || bytes[1] > 1 {
+        return Err(Error::InvalidTrace("invalid exit event flags".into()));
+    }
+    let success = bytes[0] == 1;
+    let has_code = bytes[1] == 1;
+    let code = i32::from_le_bytes(bytes[2..6].try_into().expect("checked length"));
+    Ok((has_code.then_some(code), success))
 }
 
 fn compare_stream(name: &str, recorded: &[u8], replayed: &[u8], differences: &mut Vec<String>) {
@@ -385,11 +408,7 @@ impl ProcessRun {
         let stdout = get(2, EventKind::Stdout)?.to_vec();
         let stderr = get(3, EventKind::Stderr)?.to_vec();
         let exit = get(4, EventKind::Exit)?;
-        if exit.len() != 5 {
-            return Err(Error::InvalidTrace("invalid exit event length".into()));
-        }
-        let success = exit[0] != 0;
-        let code = i32::from_le_bytes(exit[1..5].try_into().expect("checked length"));
+        let (exit_code, success) = decode_exit(exit)?;
         if events.len() != 5 {
             return Err(Error::InvalidTrace(
                 "process trace must contain exactly five events".into(),
@@ -400,7 +419,7 @@ impl ProcessRun {
             stdin,
             stdout,
             stderr,
-            exit_code: (code != i32::MIN).then_some(code),
+            exit_code,
             success,
         })
     }
@@ -520,6 +539,24 @@ mod tests {
         assert_eq!(first_difference(b"abc", b"abx"), Some(2));
         assert_eq!(first_difference(b"abc", b"abc!"), Some(3));
         assert_eq!(first_difference(b"same", b"same"), None);
+    }
+
+    #[test]
+    fn exit_encoding_preserves_the_full_signed_code_range() {
+        let encoded = encode_exit(Some(i32::MIN), false);
+        assert_eq!(
+            decode_exit(&encoded).expect("decode"),
+            (Some(i32::MIN), false)
+        );
+        assert_eq!(
+            decode_exit(&encode_exit(None, false)).expect("decode no code"),
+            (None, false)
+        );
+    }
+
+    #[test]
+    fn accepts_targets_that_close_stdin_early() {
+        assert!(finish_stdin_write(Err(io::Error::from(io::ErrorKind::BrokenPipe))).is_ok());
     }
 
     #[test]
