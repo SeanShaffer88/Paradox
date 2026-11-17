@@ -29,6 +29,13 @@ cargo test
 cargo build --release
 ```
 
+## Download for Windows x64
+
+Each GitHub Release includes a Windows x64 ZIP containing `paradox.exe`, this
+README, and the license, plus a `.sha256` checksum file. Verify the downloaded
+archive in PowerShell with `Get-FileHash .\paradox-vX.Y.Z-windows-x64.zip
+-Algorithm SHA256`.
+
 ## Record and replay a process
 
 Record a program by piping its standard input to Paradox. The target's stdout
