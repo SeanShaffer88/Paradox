@@ -39,6 +39,11 @@ metadata, and exit status:
 "hello`n" | .\target\release\paradox.exe record --output run.trace -- .\target.exe --mode demo
 ```
 
+Paradox refuses to replace an existing trace by default. Pass `--force` to
+replace one intentionally. It rejects a trace path that resolves to the target
+executable. Stdin, stdout, and stderr each have a 64 MiB cap; oversized streams
+fail recording without retaining unbounded process output in memory.
+
 Replay explicitly names the executable to run. The path in a trace is metadata;
 Paradox will not launch it on its own:
 
@@ -105,9 +110,10 @@ All integers are little-endian. A trace is:
 | Trailer | 8-byte `PARADEND` marker, `u64` event count |
 
 Event kinds are `1` process metadata, `2` stdin, `3` stdout, `4` stderr, `5`
-exit status, and `32` explicitly instrumented application values. The exit
-payload stores a success flag, an exit-code-present flag, and a signed 32-bit
-code. Application event payloads are defined by the instrumentation API.
+exit status, `32` raw application values, and `33` labeled application values.
+The distinct user-event kinds let replay reject raw/labeled API mismatches.
+The exit payload stores a success flag, an exit-code-present flag, and a signed
+32-bit code. Application event payloads are defined by the instrumentation API.
 Payloads are limited to 64 MiB. Frames are streamed through buffered file I/O
 and decoded into owned values. Checksums detect accidental corruption; they do
 not provide authentication or protect a trace against malicious modification.

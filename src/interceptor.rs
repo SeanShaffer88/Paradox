@@ -48,11 +48,11 @@ impl EventSession {
 
         match self {
             Self::Recording(recorder) => {
-                recorder.record(EventKind::User, &payload)?;
+                recorder.record(EventKind::LabeledUser, &payload)?;
                 Ok(value.to_vec())
             }
             Self::Replaying(cursor) => {
-                let recorded = cursor.expect(EventKind::User)?;
+                let recorded = cursor.expect(EventKind::LabeledUser)?;
                 let label_len_bytes = recorded
                     .get(..4)
                     .ok_or_else(|| Error::InvalidTrace("labeled event is truncated".into()))?;
@@ -315,6 +315,25 @@ mod tests {
             .memory_delta("counter", 3, &[2], &[9])
             .expect_err("pre-state must match");
         assert!(error.to_string().contains("memory pre-state mismatch"));
+        std::fs::remove_file(path).expect("remove trace");
+    }
+
+    #[test]
+    fn raw_and_labeled_events_cannot_be_confused() {
+        let path = temp_path();
+        let mut recording = EventSession::record_to(&path).expect("create trace");
+        recording
+            .nondeterministic_value(b"raw")
+            .expect("record raw event");
+        recording.finish().expect("finish recording");
+
+        let mut replay = EventSession::replay_from(&path).expect("open trace");
+        let error = replay
+            .labeled_value("call-site", b"live")
+            .expect_err("event kinds must differ");
+        assert!(error
+            .to_string()
+            .contains("expected event kind 33, found 32"));
         std::fs::remove_file(path).expect("remove trace");
     }
 }

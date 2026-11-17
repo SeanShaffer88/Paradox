@@ -60,6 +60,7 @@ pub enum EventKind {
     Stderr = 4,
     Exit = 5,
     User = 32,
+    LabeledUser = 33,
 }
 
 impl EventKind {
@@ -71,6 +72,7 @@ impl EventKind {
             4 => Ok(Self::Stderr),
             5 => Ok(Self::Exit),
             32 => Ok(Self::User),
+            33 => Ok(Self::LabeledUser),
             _ => Err(Error::InvalidTrace(format!("unknown event kind {value}"))),
         }
     }

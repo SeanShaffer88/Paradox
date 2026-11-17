@@ -3,7 +3,7 @@ use paradox_replay::replay::ReplayCursor;
 use paradox_replay::storage::read_trace;
 use paradox_replay::{Error, EventKind, TraceEvent};
 use std::env;
-use std::ffi::OsString;
+use std::ffi::{OsStr, OsString};
 use std::io::{self, Read, Write};
 use std::path::{Path, PathBuf};
 use std::process::{Command, Output, Stdio};
@@ -59,8 +59,9 @@ fn run() -> Result<(), Error> {
 }
 
 fn record_command(args: Vec<OsString>) -> Result<(), Error> {
-    let (trace_path, executable, arguments) = parse_target_args(args)?;
+    let (trace_path, executable, arguments, force) = parse_target_args(args)?;
     let working_directory = env::current_dir()?;
+    validate_trace_destination(&trace_path, &executable, &working_directory, force)?;
     let stdin = read_bounded(io::stdin(), MAX_CAPTURE_BYTES, "stdin")?;
     let output = run_child(&executable, &arguments, &working_directory, &stdin)?;
     let executable_text = executable
@@ -79,7 +80,11 @@ fn record_command(args: Vec<OsString>) -> Result<(), Error> {
         })
         .collect::<Result<Vec<_>, _>>()?;
 
-    let mut recorder = Recorder::create(&trace_path)?;
+    let mut recorder = if force {
+        Recorder::create_overwrite(&trace_path)?
+    } else {
+        Recorder::create(&trace_path)?
+    };
     recorder.record(
         EventKind::Process,
         &encode_metadata(&ProcessMetadata {
@@ -199,8 +204,11 @@ fn debug_command(args: Vec<OsString>) -> Result<(), Error> {
     Ok(())
 }
 
-fn parse_target_args(args: Vec<OsString>) -> Result<(PathBuf, OsString, Vec<OsString>), Error> {
+fn parse_target_args(
+    args: Vec<OsString>,
+) -> Result<(PathBuf, OsString, Vec<OsString>, bool), Error> {
     let mut trace = None;
+    let mut force = false;
     let mut index = 0;
     while index < args.len() {
         if args[index] == "--output" {
@@ -210,6 +218,9 @@ fn parse_target_args(args: Vec<OsString>) -> Result<(PathBuf, OsString, Vec<OsSt
                 .ok_or_else(|| Error::Process("--output needs a path".into()))?;
             trace = Some(PathBuf::from(value));
             index += 1;
+        } else if args[index] == "--force" {
+            force = true;
+            index += 1;
         } else if args[index] == "--" {
             index += 1;
             break;
@@ -218,14 +229,16 @@ fn parse_target_args(args: Vec<OsString>) -> Result<(PathBuf, OsString, Vec<OsSt
         }
     }
     let trace = trace.ok_or_else(|| {
-        Error::Process("usage: paradox record --output trace.log -- program.exe [args...]".into())
+        Error::Process(
+            "usage: paradox record --output trace.log [--force] -- program.exe [args...]".into(),
+        )
     })?;
     let executable = args
         .get(index)
         .ok_or_else(|| Error::Process("missing target executable".into()))?
         .clone();
     let arguments = args[index + 1..].to_vec();
-    Ok((trace, executable, arguments))
+    Ok((trace, executable, arguments, force))
 }
 
 fn parse_trace_arg(args: Vec<OsString>) -> Result<PathBuf, Error> {
@@ -290,14 +303,58 @@ fn run_child(
         .spawn()
         .map_err(|error| Error::Process(format!("could not launch target: {error}")))?;
     let mut child_stdin = child.stdin.take().expect("piped stdin");
+    let child_stdout = child.stdout.take().expect("piped stdout");
+    let child_stderr = child.stderr.take().expect("piped stderr");
     let input = stdin_bytes.to_vec();
     let writer = thread::spawn(move || child_stdin.write_all(&input));
-    let output = child.wait_with_output()?;
+    let stdout_reader =
+        thread::spawn(move || capture_child_output(child_stdout, MAX_CAPTURE_BYTES));
+    let stderr_reader =
+        thread::spawn(move || capture_child_output(child_stderr, MAX_CAPTURE_BYTES));
+    let status = child.wait()?;
     let write_result = writer
         .join()
         .map_err(|_| Error::Process("stdin writer thread panicked".into()))?;
     finish_stdin_write(write_result)?;
-    Ok(output)
+    let (stdout, stdout_exceeded) = stdout_reader
+        .join()
+        .map_err(|_| Error::Process("stdout reader thread panicked".into()))??;
+    let (stderr, stderr_exceeded) = stderr_reader
+        .join()
+        .map_err(|_| Error::Process("stderr reader thread panicked".into()))??;
+    if stdout_exceeded || stderr_exceeded {
+        let streams = match (stdout_exceeded, stderr_exceeded) {
+            (true, true) => "stdout and stderr",
+            (true, false) => "stdout",
+            (false, true) => "stderr",
+            (false, false) => unreachable!(),
+        };
+        return Err(Error::Process(format!(
+            "{streams} exceeded the {MAX_CAPTURE_BYTES}-byte capture limit"
+        )));
+    }
+    Ok(Output {
+        status,
+        stdout,
+        stderr,
+    })
+}
+
+fn capture_child_output<R: Read>(mut reader: R, limit: usize) -> io::Result<(Vec<u8>, bool)> {
+    let mut output = Vec::new();
+    let mut buffer = [0u8; 8192];
+    let mut exceeded = false;
+    loop {
+        let count = reader.read(&mut buffer)?;
+        if count == 0 {
+            break;
+        }
+        let remaining = limit.saturating_sub(output.len());
+        let retained = count.min(remaining);
+        output.extend_from_slice(&buffer[..retained]);
+        exceeded |= retained < count;
+    }
+    Ok((output, exceeded))
 }
 
 fn finish_stdin_write(result: io::Result<()>) -> Result<(), Error> {
@@ -305,6 +362,102 @@ fn finish_stdin_write(result: io::Result<()>) -> Result<(), Error> {
         Ok(()) => Ok(()),
         Err(error) if error.kind() == io::ErrorKind::BrokenPipe => Ok(()),
         Err(error) => Err(Error::Io(error)),
+    }
+}
+
+fn validate_trace_destination(
+    trace_path: &Path,
+    executable: &OsStr,
+    working_directory: &Path,
+    force: bool,
+) -> Result<(), Error> {
+    let output_path = absolute_for_comparison(trace_path, working_directory)?;
+    if output_path.exists() && !force {
+        return Err(Error::Process(format!(
+            "trace file {} already exists; pass --force to replace it",
+            trace_path.display()
+        )));
+    }
+
+    if let Some(executable_path) = resolve_executable_path(executable, working_directory) {
+        if executable_path == output_path {
+            return Err(Error::Process(
+                "trace output path must not be the target executable".into(),
+            ));
+        }
+    }
+    Ok(())
+}
+
+fn absolute_for_comparison(path: &Path, working_directory: &Path) -> Result<PathBuf, Error> {
+    let absolute = if path.is_absolute() {
+        path.to_path_buf()
+    } else {
+        working_directory.join(path)
+    };
+    match absolute.canonicalize() {
+        Ok(path) => Ok(path),
+        Err(error) if error.kind() == io::ErrorKind::NotFound => {
+            let file_name = absolute
+                .file_name()
+                .ok_or_else(|| Error::Process("trace path must name a file".into()))?;
+            let parent = absolute
+                .parent()
+                .unwrap_or(working_directory)
+                .canonicalize()?;
+            Ok(parent.join(file_name))
+        }
+        Err(error) => Err(Error::Io(error)),
+    }
+}
+
+fn resolve_executable_path(executable: &OsStr, working_directory: &Path) -> Option<PathBuf> {
+    let path = Path::new(executable);
+    if path.is_absolute() || path.components().count() > 1 {
+        let path = if path.is_absolute() {
+            path.to_path_buf()
+        } else {
+            working_directory.join(path)
+        };
+        return path.canonicalize().ok();
+    }
+
+    let mut directories = vec![working_directory.to_path_buf()];
+    if let Some(path) = env::var_os("PATH") {
+        directories.extend(env::split_paths(&path));
+    }
+    for directory in directories {
+        for candidate in executable_candidates(directory.join(path)) {
+            if candidate.is_file() {
+                if let Ok(canonical) = candidate.canonicalize() {
+                    return Some(canonical);
+                }
+            }
+        }
+    }
+    None
+}
+
+fn executable_candidates(path: PathBuf) -> Vec<PathBuf> {
+    #[cfg(windows)]
+    {
+        let mut candidates = vec![path.clone()];
+        if path.extension().is_none() {
+            let extensions =
+                env::var_os("PATHEXT").unwrap_or_else(|| OsString::from(".COM;.EXE;.BAT;.CMD"));
+            for extension in extensions.to_string_lossy().split(';') {
+                if !extension.is_empty() {
+                    let mut candidate = path.as_os_str().to_os_string();
+                    candidate.push(extension);
+                    candidates.push(PathBuf::from(candidate));
+                }
+            }
+        }
+        candidates
+    }
+    #[cfg(not(windows))]
+    {
+        vec![path]
     }
 }
 
@@ -494,6 +647,7 @@ fn event_name(kind: EventKind) -> &'static str {
         EventKind::Stderr => "stderr",
         EventKind::Exit => "exit",
         EventKind::User => "user",
+        EventKind::LabeledUser => "labeled",
     }
 }
 
@@ -511,6 +665,7 @@ fn print_event(event: &TraceEvent) {
         EventKind::Stderr => println!("  captured stderr (not displayed)"),
         EventKind::Exit => println!("  recorded process exit status"),
         EventKind::User => println!("  explicitly instrumented application event"),
+        EventKind::LabeledUser => println!("  labeled deterministic application event"),
     }
 }
 
@@ -519,7 +674,7 @@ fn print_help() {
         "Paradox — process I/O replay and trace inspection\n\
          \n\
          Commands:\n\
-           paradox record --output trace.log -- program.exe [args...]\n\
+           paradox record --output trace.log [--force] -- program.exe [args...]\n\
            paradox replay run --trace trace.log --executable program.exe\n\
            paradox replay debug --trace trace.log\n\
            paradox debug --trace trace.log\n\
@@ -533,6 +688,18 @@ fn print_help() {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use std::io::Cursor;
+    use std::time::{SystemTime, UNIX_EPOCH};
+
+    fn temp_directory() -> PathBuf {
+        let stamp = SystemTime::now()
+            .duration_since(UNIX_EPOCH)
+            .expect("clock")
+            .as_nanos();
+        let path = env::temp_dir().join(format!("paradox-cli-{stamp}"));
+        std::fs::create_dir(&path).expect("create temp directory");
+        path
+    }
 
     #[test]
     fn reports_first_stream_mismatch_including_length_only_differences() {
@@ -557,6 +724,29 @@ mod tests {
     #[test]
     fn accepts_targets_that_close_stdin_early() {
         assert!(finish_stdin_write(Err(io::Error::from(io::ErrorKind::BrokenPipe))).is_ok());
+    }
+
+    #[test]
+    fn child_output_capture_caps_memory_and_drains_remaining_bytes() {
+        let (captured, exceeded) =
+            capture_child_output(Cursor::new(b"abcdefgh"), 4).expect("capture output");
+        assert_eq!(captured, b"abcd");
+        assert!(exceeded);
+    }
+
+    #[test]
+    fn trace_output_cannot_replace_the_target_even_with_force() {
+        let directory = temp_directory();
+        let executable = directory.join("target.exe");
+        std::fs::write(&executable, b"binary").expect("create target");
+        let error =
+            validate_trace_destination(&executable, executable.as_os_str(), &directory, true)
+                .expect_err("target path must not become trace");
+        assert!(error
+            .to_string()
+            .contains("must not be the target executable"));
+        assert_eq!(std::fs::read(&executable).expect("read target"), b"binary");
+        std::fs::remove_dir_all(directory).expect("remove temp directory");
     }
 
     #[test]

@@ -2,7 +2,7 @@
 
 use crate::format;
 use crate::{Error, TraceEvent};
-use std::fs::File;
+use std::fs::{File, OpenOptions};
 use std::io::{BufReader, BufWriter, Write};
 use std::path::Path;
 
@@ -13,7 +13,16 @@ pub struct TraceWriter {
 
 impl TraceWriter {
     pub fn create(path: impl AsRef<Path>) -> Result<Self, Error> {
-        let file = File::create(path)?;
+        let file = OpenOptions::new().write(true).create_new(true).open(path)?;
+        Self::from_file(file)
+    }
+
+    /// Create a trace after explicitly choosing to replace an existing file.
+    pub fn create_overwrite(path: impl AsRef<Path>) -> Result<Self, Error> {
+        Self::from_file(File::create(path)?)
+    }
+
+    fn from_file(file: File) -> Result<Self, Error> {
         let mut writer = BufWriter::new(file);
         format::write_header(&mut writer)?;
         Ok(Self { writer, count: 0 })
@@ -88,6 +97,18 @@ mod tests {
         std::fs::write(&path, bytes).expect("corrupt trace");
         let error = read_trace(&path).expect_err("checksum should fail");
         assert!(error.to_string().contains("checksum mismatch"));
+        std::fs::remove_file(path).expect("remove trace");
+    }
+
+    #[test]
+    fn create_does_not_overwrite_an_existing_file() {
+        let path = temp_path();
+        std::fs::write(&path, b"keep this").expect("create existing file");
+        assert!(TraceWriter::create(&path).is_err());
+        assert_eq!(
+            std::fs::read(&path).expect("read existing file"),
+            b"keep this"
+        );
         std::fs::remove_file(path).expect("remove trace");
     }
 }
