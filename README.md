@@ -24,6 +24,7 @@ target.
 
 ```powershell
 cargo fmt --check
+cargo clippy --all-targets -- -D warnings
 cargo test
 cargo build --release
 ```
@@ -65,25 +66,28 @@ contains no register snapshots.
 ## Instrumented deterministic inputs
 
 Applications can use the library's `EventSession` to log explicit
-nondeterministic values and consume them again in the same order:
+nondeterministic values and consume them again in the same order. Prefer
+`labeled_value` so replay catches call-site reordering:
 
 ```rust
 use paradox_replay::interceptor::EventSession;
 
 fn main() -> Result<(), Box<dyn std::error::Error>> {
     let mut session = EventSession::record_to("events.trace")?;
-    let captured = session.nondeterministic_value(b"application supplied input")?;
-    assert_eq!(captured, b"application supplied input");
+    let captured = session.labeled_value("http.request-id", b"request-42")?;
+    assert_eq!(captured, b"request-42");
     session.finish()?;
     Ok(())
 }
 ```
 
 During replay, open the same file with `EventSession::replay_from`, call
-`nondeterministic_value` at the corresponding points, and finish the session.
-Replay returns recorded bytes instead of the caller's current bytes and reports
-an error if the event kind or sequence does not match. This is an explicit
-application API; it does not hook operating-system boundaries.
+`labeled_value` at the corresponding points, and finish the session. Replay
+returns recorded bytes instead of the caller's current bytes and errors if the
+label, event kind, or sequence does not match. `clock_ticks(label, current)`
+does the same for caller-supplied `u64` clock values. These are explicit
+application APIs; they do not hook operating-system boundaries or control
+thread scheduling.
 
 ## Trace format, version 1
 

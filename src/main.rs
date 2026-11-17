@@ -129,20 +129,28 @@ fn replay_command(args: Vec<OsString>) -> Result<(), Error> {
         .collect::<Vec<_>>();
     let working_directory = PathBuf::from(&recorded.metadata.working_directory);
     let actual = run_child(&executable, &arguments, &working_directory, &recorded.stdin)?;
-    let actual_exit = encode_exit(actual.status.code(), actual.status.success());
-    let expected_exit = encode_exit(recorded.exit_code, recorded.success);
-    let matches = actual.stdout == recorded.stdout
-        && actual.stderr == recorded.stderr
-        && actual_exit == expected_exit;
     io::stdout().write_all(&actual.stdout)?;
     io::stderr().write_all(&actual.stderr)?;
-    if matches {
+    let mut differences = Vec::new();
+    compare_stream("stdout", &recorded.stdout, &actual.stdout, &mut differences);
+    compare_stream("stderr", &recorded.stderr, &actual.stderr, &mut differences);
+    if actual.status.code() != recorded.exit_code || actual.status.success() != recorded.success {
+        differences.push(format!(
+            "exit status recorded {:?} (success: {}), replayed {:?} (success: {})",
+            recorded.exit_code,
+            recorded.success,
+            actual.status.code(),
+            actual.status.success()
+        ));
+    }
+    if differences.is_empty() {
         println!("\nReplay matched the recorded stdout, stderr, and exit status.");
         Ok(())
     } else {
-        Err(Error::Process(
-            "replay diverged: stdout, stderr, or exit status differs".into(),
-        ))
+        Err(Error::Process(format!(
+            "replay diverged: {}",
+            differences.join("; ")
+        )))
     }
 }
 
@@ -318,6 +326,32 @@ fn encode_exit(code: Option<i32>, success: bool) -> Vec<u8> {
     output
 }
 
+fn compare_stream(name: &str, recorded: &[u8], replayed: &[u8], differences: &mut Vec<String>) {
+    let Some(offset) = first_difference(recorded, replayed) else {
+        return;
+    };
+    let detail = if offset < recorded.len().min(replayed.len()) {
+        format!("first differs at byte {offset}")
+    } else {
+        format!("first differs at byte {offset} (one stream ended)")
+    };
+    differences.push(format!(
+        "{name} {detail} (recorded {} bytes, replayed {} bytes)",
+        recorded.len(),
+        replayed.len()
+    ));
+}
+
+fn first_difference(recorded: &[u8], replayed: &[u8]) -> Option<usize> {
+    recorded
+        .iter()
+        .zip(replayed)
+        .position(|(expected, actual)| expected != actual)
+        .or_else(|| {
+            (recorded.len() != replayed.len()).then_some(recorded.len().min(replayed.len()))
+        })
+}
+
 fn put_string(output: &mut Vec<u8>, value: &str) {
     output.extend_from_slice(&(value.len() as u32).to_le_bytes());
     output.extend_from_slice(value.as_bytes());
@@ -480,6 +514,13 @@ fn print_help() {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn reports_first_stream_mismatch_including_length_only_differences() {
+        assert_eq!(first_difference(b"abc", b"abx"), Some(2));
+        assert_eq!(first_difference(b"abc", b"abc!"), Some(3));
+        assert_eq!(first_difference(b"same", b"same"), None);
+    }
 
     #[test]
     fn metadata_round_trip() {
