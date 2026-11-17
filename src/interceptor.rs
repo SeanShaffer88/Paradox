@@ -90,11 +90,120 @@ impl EventSession {
         Ok(ticks)
     }
 
+    /// Record or verify an application-provided thread-order marker.
+    ///
+    /// This detects an order/thread mismatch; it does not pause or schedule threads.
+    pub fn thread_marker(&mut self, label: &str, thread_id: u64) -> Result<(), Error> {
+        let bytes = self.labeled_value(label, &thread_id.to_le_bytes())?;
+        let recorded = bytes
+            .as_slice()
+            .try_into()
+            .map(u64::from_le_bytes)
+            .map_err(|_| Error::InvalidTrace("thread marker must contain 8 bytes".into()))?;
+        if recorded != thread_id {
+            return Err(Error::Process(format!(
+                "thread marker `{label}` differs: recorded {recorded}, replayed {thread_id}"
+            )));
+        }
+        Ok(())
+    }
+
+    /// Record a delta for an app-supplied stable location ID.
+    ///
+    /// Replay checks the location and prior bytes, then returns the recorded
+    /// post-state. The library never reads or writes process memory itself.
+    pub fn memory_delta(
+        &mut self,
+        label: &str,
+        location_id: u64,
+        before: &[u8],
+        after: &[u8],
+    ) -> Result<Vec<u8>, Error> {
+        let payload = encode_memory_delta(location_id, before, after)?;
+        let recorded = self.labeled_value(label, &payload)?;
+        let (recorded_location, recorded_before, recorded_after) = decode_memory_delta(&recorded)?;
+        if recorded_location != location_id {
+            return Err(Error::Process(format!(
+                "memory location mismatch at `{label}`: recorded {recorded_location}, replayed {location_id}"
+            )));
+        }
+        if recorded_before != before {
+            return Err(Error::Process(format!(
+                "memory pre-state mismatch at `{label}`"
+            )));
+        }
+        Ok(recorded_after.to_vec())
+    }
+
     pub fn finish(self) -> Result<(), Error> {
         match self {
             Self::Recording(recorder) => recorder.finish(),
             Self::Replaying(cursor) => cursor.ensure_finished(),
         }
+    }
+}
+
+fn encode_memory_delta(location_id: u64, before: &[u8], after: &[u8]) -> Result<Vec<u8>, Error> {
+    let before_len = u32::try_from(before.len())
+        .map_err(|_| Error::Process("memory pre-state is too large".into()))?;
+    let after_len = u32::try_from(after.len())
+        .map_err(|_| Error::Process("memory post-state is too large".into()))?;
+    let mut payload = Vec::with_capacity(16 + before.len() + after.len());
+    payload.extend_from_slice(&location_id.to_le_bytes());
+    payload.extend_from_slice(&before_len.to_le_bytes());
+    payload.extend_from_slice(before);
+    payload.extend_from_slice(&after_len.to_le_bytes());
+    payload.extend_from_slice(after);
+    Ok(payload)
+}
+
+fn decode_memory_delta(bytes: &[u8]) -> Result<(u64, &[u8], &[u8]), Error> {
+    let mut reader = DeltaReader { bytes, offset: 0 };
+    let location_id = reader.u64()?;
+    let before = reader.field()?;
+    let after = reader.field()?;
+    if reader.offset != bytes.len() {
+        return Err(Error::InvalidTrace(
+            "unexpected bytes after memory delta".into(),
+        ));
+    }
+    Ok((location_id, before, after))
+}
+
+struct DeltaReader<'a> {
+    bytes: &'a [u8],
+    offset: usize,
+}
+
+impl<'a> DeltaReader<'a> {
+    fn take(&mut self, length: usize) -> Result<&'a [u8], Error> {
+        let end = self
+            .offset
+            .checked_add(length)
+            .ok_or_else(|| Error::InvalidTrace("memory delta length overflow".into()))?;
+        let field = self
+            .bytes
+            .get(self.offset..end)
+            .ok_or_else(|| Error::InvalidTrace("truncated memory delta".into()))?;
+        self.offset = end;
+        Ok(field)
+    }
+
+    fn u32(&mut self) -> Result<u32, Error> {
+        Ok(u32::from_le_bytes(
+            self.take(4)?.try_into().expect("checked length"),
+        ))
+    }
+
+    fn u64(&mut self) -> Result<u64, Error> {
+        Ok(u64::from_le_bytes(
+            self.take(8)?.try_into().expect("checked length"),
+        ))
+    }
+
+    fn field(&mut self) -> Result<&'a [u8], Error> {
+        let length = self.u32()? as usize;
+        self.take(length)
     }
 }
 
@@ -160,6 +269,52 @@ mod tests {
             .labeled_value("different-call", b"value")
             .expect_err("labels must match");
         assert!(error.to_string().contains("event label mismatch"));
+        std::fs::remove_file(path).expect("remove trace");
+    }
+
+    #[test]
+    fn replays_thread_markers_and_memory_deltas() {
+        let path = temp_path();
+        let mut recording = EventSession::record_to(&path).expect("create trace");
+        recording
+            .thread_marker("worker-start", 7)
+            .expect("record thread");
+        assert_eq!(
+            recording
+                .memory_delta("counter", 3, &[0], &[1])
+                .expect("record delta"),
+            [1]
+        );
+        recording.finish().expect("finish recording");
+
+        let mut replay = EventSession::replay_from(&path).expect("open trace");
+        replay
+            .thread_marker("worker-start", 7)
+            .expect("replay thread");
+        assert_eq!(
+            replay
+                .memory_delta("counter", 3, &[0], &[9])
+                .expect("replay delta"),
+            [1]
+        );
+        replay.finish().expect("consume all events");
+        std::fs::remove_file(path).expect("remove trace");
+    }
+
+    #[test]
+    fn memory_delta_rejects_a_different_prior_state() {
+        let path = temp_path();
+        let mut recording = EventSession::record_to(&path).expect("create trace");
+        recording
+            .memory_delta("counter", 3, &[0], &[1])
+            .expect("record delta");
+        recording.finish().expect("finish recording");
+
+        let mut replay = EventSession::replay_from(&path).expect("open trace");
+        let error = replay
+            .memory_delta("counter", 3, &[2], &[9])
+            .expect_err("pre-state must match");
+        assert!(error.to_string().contains("memory pre-state mismatch"));
         std::fs::remove_file(path).expect("remove trace");
     }
 }

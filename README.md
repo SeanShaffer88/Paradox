@@ -87,7 +87,12 @@ returns recorded bytes instead of the caller's current bytes and errors if the
 label, event kind, or sequence does not match. `clock_ticks(label, current)`
 does the same for caller-supplied `u64` clock values. These are explicit
 application APIs; they do not hook operating-system boundaries or control
-thread scheduling.
+thread scheduling. `thread_marker(label, thread_id)` checks that a replay sees
+the same app-reported thread marker in the same order; it does not force a
+thread to run. `memory_delta(label, location_id, before, after)` stores a
+caller-supplied transition and returns the recorded post-state during replay
+after checking the stable location ID and prior bytes. It does not inspect or
+modify arbitrary memory.
 
 ## Trace format, version 1
 
