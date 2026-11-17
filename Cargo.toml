@@ -1,0 +1,20 @@
+[package]
+name = "paradox-replay"
+version = "0.1.0"
+edition = "2021"
+description = "A zero-dependency process replay and deterministic event trace debugger"
+license = "MIT"
+readme = "README.md"
+
+[[bin]]
+name = "paradox"
+path = "src/main.rs"
+
+[lib]
+name = "paradox_replay"
+path = "src/lib.rs"
+
+[profile.release]
+lto = true
+codegen-units = 1
+strip = true
